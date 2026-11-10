@@ -1,0 +1,35 @@
+name: Post opportunities
+
+on:
+  schedule:
+    - cron: "0 9 * * *"   # every day at 09:00 UTC (change as you like)
+  workflow_dispatch:       # adds a "Run workflow" button for manual runs
+
+permissions:
+  contents: write          # lets the job save posted.json back to the repo
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Find and post opportunities
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          REVIEW_CHAT_ID: ${{ secrets.REVIEW_CHAT_ID }}
+          POST_MODE: ${{ vars.POST_MODE || 'auto' }}
+          POSTS_PER_RUN: ${{ vars.POSTS_PER_RUN || '2' }}
+        run: python agent.py
+      - name: Remember what was posted
+        run: |
+          git config user.name "volunteens-bot"
+          git config user.email "volunteens-bot@users.noreply.github.com"
+          git add posted.json
+          git diff --cached --quiet || git commit -m "Update posted opportunities"
+          git push
