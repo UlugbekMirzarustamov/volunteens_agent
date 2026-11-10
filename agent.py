@@ -2,17 +2,17 @@
 Volunteens opportunity agent.
 
 Each run:
-  1. Asks Claude (with live web search) to find NEW international opportunities
-     for high-school students: research programs, fellowships, grants,
-     competitions, summer schools, accelerators (like Lumiere, TKS, etc.).
-  2. Skips anything already posted (tracked in posted.json).
-  3. Formats each one as a Telegram post and sends it to the channel
-     (or to you privately first, in "review" mode).
+  1. Reads the Volunteens channel (https://t.me/s/Volunteensuz) to see what was
+     already posted, plus the bundled history of all past posts.
+  2. Asks Claude (with live web search) to find NEW international opportunities
+     and write each post in Uzbek, in the channel's own template
+     (examples in style_examples.json).
+  3. Sends the posts to the channel (or privately to you in "review" mode).
 
 Settings come from environment variables (see README.md):
   ANTHROPIC_API_KEY    - your Claude API key
   TELEGRAM_BOT_TOKEN   - from @BotFather
-  TELEGRAM_CHAT_ID     - channel, e.g. @volunteens  (or numeric id)
+  TELEGRAM_CHAT_ID     - channel, e.g. @Volunteensuz
   POST_MODE            - "auto" (post to channel) or "review" (send to REVIEW_CHAT_ID)
   REVIEW_CHAT_ID       - your own Telegram user id (only for review mode)
   POSTS_PER_RUN        - how many opportunities per run (default 2)
@@ -33,7 +33,13 @@ import requests
 
 HERE = Path(__file__).parent
 POSTED_FILE = HERE / "posted.json"
+HISTORY_FILE = HERE / "channel_history.json"
+EXAMPLES_FILE = HERE / "style_examples.json"
+CHANNEL = "Volunteensuz"
 MODEL = "claude-opus-5-5"
+
+FOOTER = ('📝 <a href="https://t.me/Volunteensuz">Telegram</a> | '
+          '💻 <a href="https://www.instagram.com/volunteensuz">Instagram</a>')
 
 POSTS_PER_RUN = int(os.environ.get("POSTS_PER_RUN", "2"))
 POST_MODE = os.environ.get("POST_MODE", "auto").strip().lower()
@@ -47,24 +53,12 @@ SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string"},
-                    "organizer": {"type": "string"},
-                    "category": {
-                        "type": "string",
-                        "enum": ["Research", "Fellowship", "Grant / Scholarship",
-                                 "Competition", "Summer Program", "Accelerator / Incubator",
-                                 "Volunteering", "Internship", "Online Course", "Other"],
-                    },
+                    "name": {"type": "string", "description": "Official name in English"},
                     "official_url": {"type": "string"},
                     "deadline": {"type": "string", "description": "YYYY-MM-DD, or 'Rolling'"},
-                    "eligibility": {"type": "string"},
-                    "cost": {"type": "string", "description": "e.g. 'Free', 'Fully funded', '$2,000 (financial aid available)'"},
-                    "format": {"type": "string", "description": "Online / In-person (city, country) / Hybrid"},
-                    "summary": {"type": "string", "description": "2-3 sentences: what students do and get"},
-                    "why_apply": {"type": "string", "description": "One punchy sentence on why it's worth it"},
+                    "post_text": {"type": "string", "description": "The full Uzbek post, without the Telegram/Instagram footer"},
                 },
-                "required": ["name", "organizer", "category", "official_url", "deadline",
-                             "eligibility", "cost", "format", "summary", "why_apply"],
+                "required": ["name", "official_url", "deadline", "post_text"],
                 "additionalProperties": False,
             },
         }
@@ -74,44 +68,74 @@ SCHEMA = {
 }
 
 
-def load_posted() -> list[dict]:
-    if POSTED_FILE.exists():
-        return json.loads(POSTED_FILE.read_text(encoding="utf-8"))
-    return []
+def load_json(path: Path, default):
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return default
 
 
-def save_posted(posted: list[dict]) -> None:
-    POSTED_FILE.write_text(json.dumps(posted, indent=2, ensure_ascii=False), encoding="utf-8")
+def fetch_recent_channel_titles() -> list[str]:
+    """First lines of the newest ~60 channel posts (includes posts you made by hand)."""
+    titles, before = [], None
+    for _ in range(3):
+        url = f"https://t.me/s/{CHANNEL}" + (f"?before={before}" if before else "")
+        try:
+            page = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30).text
+        except requests.RequestException:
+            break
+        ids = [int(i) for i in re.findall(rf'data-post="{CHANNEL}/(\d+)"', page)]
+        for raw in re.findall(r'<div class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', page, re.S):
+            text = html.unescape(re.sub(r"<[^>]+>", "", re.sub(r"<br\s*/?>", "\n", raw))).strip()
+            if text:
+                titles.append(text.split("\n")[0].strip()[:120])
+        if not ids:
+            break
+        before = min(ids)
+    return titles
 
 
 def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def find_opportunities(posted: list[dict]) -> list[dict]:
+def find_opportunities(already_titles: list[str]) -> list[dict]:
     today = dt.date.today().isoformat()
-    already = "\n".join(f"- {p['name']} ({p['url']})" for p in posted[-300:]) or "(none yet)"
+    examples = load_json(EXAMPLES_FILE, [])
+    examples_text = "\n\n=====\n\n".join(examples)
+    already = "\n".join(f"- {t}" for t in already_titles)
 
-    prompt = f"""Today is {today}. You find opportunities for "Volunteens", a Telegram channel that helps
-high-school students (roughly ages 14-19) from around the world, including developing countries,
-build strong extracurricular profiles for university applications.
+    prompt = f"""Today is {today}. You are the editor of "Volunteens" (t.me/Volunteensuz), an Uzbek
+Telegram channel that shares international opportunities with school and university students and
+young people from Uzbekistan: forums, summits, fellowships, research programs (like Lumiere,
+Polygence, RSI), leadership/innovation programs (like TKS), scholarships and grants, competitions
+and olympiads, summer/winter schools and camps, MUNs, internships and volunteering.
 
-Find {POSTS_PER_RUN + 2} opportunities that are OPEN NOW or opening soon, of the kind students love,
-e.g. research mentorship programs (like Lumiere, Polygence, Pioneer), innovation/leadership programs
-(like TKS - The Knowledge Society), fellowships, grants and scholarships, international olympiads and
-competitions, essay contests, summer schools, startup accelerators for teens, and
-volunteering or internship programs.
+TASK: Find {POSTS_PER_RUN + 2} opportunities that are open right now, and write a post for each.
 
-Rules:
-- Use web search, then open the OFFICIAL page of each opportunity to verify the details.
-- The application deadline must be after {today} (or genuinely rolling). Skip anything closed.
-- Must accept international students (not limited to one country's citizens).
-- Prefer free, fully funded, or need-based-aid opportunities; mix categories.
-- Only include facts you verified on the official page. Never guess a deadline; if you cannot
-  confirm it, choose a different opportunity.
-- official_url must be the opportunity's own page, not a blog or aggregator.
-- Do NOT include any of these, which were already posted:
+Research rules:
+- Use web search, then open each opportunity's OFFICIAL page to verify the facts.
+- The deadline must be after {today} (or genuinely rolling). Skip anything closed.
+- Citizens of Uzbekistan / international applicants must be eligible.
+- Prefer free, fully funded or partially funded opportunities. Mix the types.
+- Never guess a fact (deadline, age, fee). If you can't confirm it, pick another opportunity.
+- official_url = the official application or info page, not a blog or aggregator.
+- Do NOT pick anything the channel already posted. Already posted (titles of past posts):
 {already}
+
+Writing rules for post_text, which must match the channel's style EXACTLY:
+- Write in Uzbek (Latin script), as in the examples below. Keep the official program name in English.
+- Line 1: program name + short year like '27 + a country flag emoji if there is one location.
+- Then one paragraph (3-5 sentences): who organizes it, what it is, what participants do and get,
+  dates/location, and funding.
+- Then the short info lines that apply, e.g. "Yosh chegarasi: ...", "Ariza to‘lovi: Yo‘q",
+  "💳 Ariza to‘lovi mavjud", "🗓 Tadbir sanasi: ...", "📍 Manzil: ...".
+- Then "‼️ So‘nggi muddat: <day>-<Uzbek month name>" (for example 30-sentyabr; add the year if it is not this year).
+- Last line exactly: "🔗 Ro‘yxatdan o‘tish uchun: Havola"  (the word Havola becomes the link automatically)
+- Do NOT add the Telegram | Instagram footer, hashtags or markdown (**bold**, etc.). It is added automatically.
+
+Examples of real posts from the channel:
+
+{examples_text}
 
 Return exactly {POSTS_PER_RUN + 2} opportunities in the required JSON format."""
 
@@ -148,10 +172,14 @@ Return exactly {POSTS_PER_RUN + 2} opportunities in the required JSON format."""
     return json.loads(match.group(0))["opportunities"]
 
 
-def is_valid(opp: dict, posted: list[dict]) -> bool:
-    seen_names = {norm(p["name"]) for p in posted}
+def is_valid(opp: dict, posted: list[dict], titles: list[str]) -> bool:
+    name = norm(opp["name"])
     seen_urls = {p["url"].rstrip("/").lower() for p in posted}
-    if norm(opp["name"]) in seen_names or opp["official_url"].rstrip("/").lower() in seen_urls:
+    if name in {norm(p["name"]) for p in posted} or opp["official_url"].rstrip("/").lower() in seen_urls:
+        return False
+    # the name (without year) appears in a past channel title -> probably a repeat
+    core = re.sub(r"(19|20)\d\d$", "", name)
+    if len(core) >= 6 and any(core in norm(t) for t in titles):
         return False
     if not opp["official_url"].startswith("http"):
         return False
@@ -165,35 +193,15 @@ def is_valid(opp: dict, posted: list[dict]) -> bool:
     return True
 
 
-def pretty_deadline(d: str) -> str:
-    try:
-        return dt.date.fromisoformat(d[:10]).strftime("%d %B %Y")
-    except ValueError:
-        return d
-
-
-EMOJI = {
-    "Research": "🔬", "Fellowship": "🎖", "Grant / Scholarship": "💰", "Competition": "🏆",
-    "Summer Program": "☀️", "Accelerator / Incubator": "🚀", "Volunteering": "🤝",
-    "Internship": "💼", "Online Course": "💻", "Other": "✨",
-}
-
-
 def format_post(o: dict) -> str:
-    e = html.escape
-    tag = "#" + re.sub(r"[^A-Za-z]", "", o["category"].split("/")[0])
-    return (
-        f"{EMOJI.get(o['category'], '✨')} <b>{e(o['name'])}</b>\n"
-        f"<i>by {e(o['organizer'])}</i>\n\n"
-        f"{e(o['summary'])}\n\n"
-        f"🎯 <b>Who can apply:</b> {e(o['eligibility'])}\n"
-        f"📍 <b>Format:</b> {e(o['format'])}\n"
-        f"💵 <b>Cost:</b> {e(o['cost'])}\n"
-        f"⏰ <b>Deadline:</b> {e(pretty_deadline(o['deadline']))}\n\n"
-        f"💡 {e(o['why_apply'])}\n\n"
-        f"🔗 <a href=\"{e(o['official_url'], quote=True)}\">Apply / learn more</a>\n\n"
-        f"{tag} #Volunteens"
-    )
+    body = html.escape(o["post_text"].strip())
+    link = f'<a href="{html.escape(o["official_url"], quote=True)}">Havola</a>'
+    if "Havola" in body:
+        i = body.rfind("Havola")
+        body = body[:i] + link + body[i + len("Havola"):]
+    else:
+        body += f"\n\n🔗 Ro‘yxatdan o‘tish uchun: {link}"
+    return f"{body}\n\n{FOOTER}"
 
 
 def send_telegram(chat_id: str, text: str) -> None:
@@ -201,7 +209,7 @@ def send_telegram(chat_id: str, text: str) -> None:
     r = requests.post(
         f"https://api.telegram.org/bot{token}/sendMessage",
         json={"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": False},
+              "link_preview_options": {"is_disabled": True}},
         timeout=30,
     )
     if not r.ok:
@@ -209,15 +217,17 @@ def send_telegram(chat_id: str, text: str) -> None:
 
 
 def main() -> int:
-    posted = load_posted()
-    found = find_opportunities(posted)
-    fresh = [o for o in found if is_valid(o, posted)][:POSTS_PER_RUN]
+    posted = load_json(POSTED_FILE, [])
+    history = [h["title"] for h in load_json(HISTORY_FILE, [])]
+    recent = fetch_recent_channel_titles()
+    titles = list(dict.fromkeys(history[-300:] + recent + [p["name"] for p in posted]))
+
+    found = find_opportunities(titles)
+    all_titles = history + recent
+    fresh = [o for o in found if is_valid(o, posted, all_titles)][:POSTS_PER_RUN]
     print(f"Found {len(found)}, {len(fresh)} new and valid.")
 
-    if POST_MODE == "review":
-        target = os.environ["REVIEW_CHAT_ID"]
-    else:
-        target = os.environ.get("TELEGRAM_CHAT_ID", "")
+    target = os.environ["REVIEW_CHAT_ID"] if POST_MODE == "review" else os.environ.get("TELEGRAM_CHAT_ID", "")
 
     for o in fresh:
         post = format_post(o)
@@ -230,7 +240,7 @@ def main() -> int:
                        "deadline": o["deadline"], "posted_on": dt.date.today().isoformat()})
 
     if not DRY_RUN:
-        save_posted(posted)
+        POSTED_FILE.write_text(json.dumps(posted, indent=2, ensure_ascii=False), encoding="utf-8")
     return 0
 
 
