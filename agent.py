@@ -137,7 +137,8 @@ Examples of real posts from the channel:
 
 {examples_text}
 
-Return exactly {POSTS_PER_RUN + 2} opportunities in the required JSON format."""
+Return {POSTS_PER_RUN + 2} opportunities in the required JSON format. If you could verify fewer,
+return the ones you verified. Never return an empty list: there are always open opportunities."""
 
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": prompt}]
@@ -166,11 +167,19 @@ Return exactly {POSTS_PER_RUN + 2} opportunities in the required JSON format."""
     if response.stop_reason == "refusal":
         raise RuntimeError("Claude declined the request.")
 
-    text = "".join(b.text for b in response.content if b.type == "text").strip()
-    match = re.search(r"\{.*\}", text, re.S)
-    if not match:
-        raise RuntimeError(f"No JSON in response:\n{text[:2000]}")
-    return json.loads(match.group(0))["opportunities"]
+    print(f"stop_reason={response.stop_reason} usage={response.usage}")
+    texts = [b.text for b in response.content if b.type == "text"]
+    for t in reversed(texts):  # the JSON answer is the last text block
+        match = re.search(r"\{.*\}", t, re.S)
+        if match:
+            try:
+                opps = json.loads(match.group(0))["opportunities"]
+            except (json.JSONDecodeError, KeyError):
+                continue
+            if not opps:
+                print("Empty list. Last text from Claude:\n", "\n".join(texts)[-3000:])
+            return opps
+    raise RuntimeError("No JSON in response:\n" + "\n".join(texts)[-3000:])
 
 
 def is_valid(opp: dict, posted: list[dict], titles: list[str]) -> bool:
@@ -227,8 +236,14 @@ def main() -> int:
     all_titles = history + recent
     fresh = [o for o in found if is_valid(o, posted, all_titles)][:POSTS_PER_RUN]
     print(f"Found {len(found)}, {len(fresh)} new and valid.")
+    for o in found:
+        if o not in fresh:
+            print("Skipped:", o["name"], o["deadline"], o["official_url"])
 
     target = os.environ["REVIEW_CHAT_ID"] if POST_MODE == "review" else os.environ.get("TELEGRAM_CHAT_ID", "")
+
+    if not fresh and POST_MODE == "review" and not DRY_RUN:
+        send_telegram(target, "⚠️ Volunteens agent: bugun yangi imkoniyat topilmadi. GitHub Actions logini tekshiring.")
 
     for o in fresh:
         post = format_post(o)
