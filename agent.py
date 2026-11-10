@@ -4,10 +4,11 @@ Volunteens opportunity agent.
 Each run:
   1. Reads the Volunteens channel (https://t.me/s/Volunteensuz) to see what was
      already posted, plus the bundled history of all past posts.
-  2. Asks Claude (with live web search) to find NEW international opportunities
-     and write each post in Uzbek, in the channel's own template
-     (examples in style_examples.json).
-  3. Sends the posts to the channel (or privately to you in "review" mode).
+  2. Haiku 5.5 (with live web search) finds NEW international opportunities and
+     verifies the facts on official pages.
+  3. Haiku 5.5 (no tools) writes each post in Uzbek from those facts, in the
+     channel's own template (examples in style_examples.json).
+  4. Sends the posts to the channel (or privately to you in "review" mode).
 
 Settings come from environment variables (see README.md):
   ANTHROPIC_API_KEY    - your Claude API key
@@ -36,7 +37,8 @@ POSTED_FILE = HERE / "posted.json"
 HISTORY_FILE = HERE / "channel_history.json"
 EXAMPLES_FILE = HERE / "style_examples.json"
 CHANNEL = "Volunteensuz"
-MODEL = "claude-sonnet-5-5"  # about half the price of Opus
+SEARCH_MODEL = "claude-haiku-5-5"  # cheap: does the web search and fact-checking
+WRITER_MODEL = "claude-haiku-5-5"  # writes the posts (no tools, so few tokens)
 
 FOOTER = ('📝 <a href="https://t.me/Volunteensuz">Telegram</a> | '
           '💻 <a href="https://www.instagram.com/volunteensuz">Instagram</a>')
@@ -59,6 +61,30 @@ SCHEMA = {
                     "post_text": {"type": "string", "description": "The full Uzbek post, without the Telegram/Instagram footer"},
                 },
                 "required": ["name", "official_url", "deadline", "post_text"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["opportunities"],
+    "additionalProperties": False,
+}
+
+FACTS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "opportunities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Official name in English"},
+                    "official_url": {"type": "string"},
+                    "deadline": {"type": "string", "description": "YYYY-MM-DD, or 'Rolling'"},
+                    "facts": {"type": "string", "description": (
+                        "Verified facts in English: organizer, what it is, what participants do and get, "
+                        "event dates, location, funding, age limit, application fee, eligibility")},
+                },
+                "required": ["name", "official_url", "deadline", "facts"],
                 "additionalProperties": False,
             },
         }
@@ -98,29 +124,91 @@ def norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]", "", s.lower())
 
 
-def find_opportunities(already_titles: list[str]) -> list[dict]:
+def _run(client: anthropic.Anthropic, label: str, **kwargs) -> list[dict]:
+    """Stream one request (resuming pause_turn) and return its JSON 'opportunities' list."""
+    messages = kwargs.pop("messages")
+    for _ in range(5):  # resume if the server pauses a long search turn
+        with client.beta.messages.stream(messages=messages, **kwargs) as stream:
+            response = stream.get_final_message()
+        if response.stop_reason == "pause_turn":
+            messages.append({"role": "assistant", "content": response.content})
+            continue
+        break
+
+    if response.stop_reason == "refusal":
+        raise RuntimeError(f"[{label}] Claude declined the request.")
+
+    print(f"[{label}] model={response.model} stop_reason={response.stop_reason} usage={response.usage}")
+    texts = [b.text for b in response.content if b.type == "text"]
+    for t in reversed(texts):  # the JSON answer is the last text block
+        match = re.search(r"\{.*\}", t, re.S)
+        if match:
+            try:
+                opps = json.loads(match.group(0))["opportunities"]
+            except (json.JSONDecodeError, KeyError):
+                continue
+            if not opps:
+                print(f"[{label}] Empty list. Last text from Claude:\n", "\n".join(texts)[-3000:])
+            return opps
+    raise RuntimeError(f"[{label}] No JSON in response:\n" + "\n".join(texts)[-3000:])
+
+
+def research_opportunities(client: anthropic.Anthropic, already_titles: list[str]) -> list[dict]:
+    """Step 1 (Haiku 5.5): web search + verify facts on official pages. English facts only."""
     today = dt.date.today().isoformat()
-    examples = load_json(EXAMPLES_FILE, [])
-    examples_text = "\n\n=====\n\n".join(examples[-5:])
     already = "\n".join(f"- {t}" for t in already_titles)
 
-    prompt = f"""Today is {today}. You are the editor of "Volunteens" (t.me/Volunteensuz), an Uzbek
-Telegram channel that shares international opportunities with school and university students and
-young people from Uzbekistan: forums, summits, fellowships, research programs (like Lumiere,
+    prompt = f"""Today is {today}. You research opportunities for "Volunteens" (t.me/Volunteensuz), an
+Uzbek Telegram channel that shares international opportunities with school and university students
+and young people from Uzbekistan: forums, summits, fellowships, research programs (like Lumiere,
 Polygence, RSI), leadership/innovation programs (like TKS), scholarships and grants, competitions
 and olympiads, summer/winter schools and camps, MUNs, internships and volunteering.
 
-TASK: Find {POSTS_PER_RUN + 2} opportunities that are open right now, and write a post for each.
+TASK: Find {POSTS_PER_RUN + 2} opportunities that are open right now and collect verified facts.
 
-Research rules:
+Rules:
 - Use web search, then open each opportunity's OFFICIAL page to verify the facts.
 - The deadline must be after {today} (or genuinely rolling). Skip anything closed.
 - Citizens of Uzbekistan / international applicants must be eligible.
 - Prefer free, fully funded or partially funded opportunities. Mix the types.
-- Never guess a fact (deadline, age, fee). If you can't confirm it, pick another opportunity.
+- Never guess a fact (deadline, age, fee). If you can't confirm it, leave it out or pick another opportunity.
 - official_url = the official application or info page, not a blog or aggregator.
+- In "facts", write in English everything a post needs: organizer, what it is, what participants
+  do and get, event dates, location, funding, age limit, application fee, eligibility.
 - Do NOT pick anything the channel already posted. Already posted (titles of past posts):
 {already}
+
+Return {POSTS_PER_RUN + 2} opportunities in the required JSON format. If you could verify fewer,
+return the ones you verified. Never return an empty list: there are always open opportunities."""
+
+    return _run(
+        client, "search",
+        model=SEARCH_MODEL,
+        max_tokens=32000,
+        output_config={"effort": "medium", "format": {"type": "json_schema", "schema": FACTS_SCHEMA}},
+        tools=[
+            # Haiku doesn't support the _20260209 (dynamic filtering) variants
+            {"type": "web_search_20250305", "name": "web_search", "max_uses": 8},
+            {"type": "web_fetch_20250910", "name": "web_fetch", "max_uses": 8,
+             "max_content_tokens": 6000},
+        ],
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def write_posts(client: anthropic.Anthropic, facts: list[dict]) -> list[dict]:
+    """Step 2 (Haiku 5.5): turn the verified facts into Uzbek posts in the channel's style."""
+    today = dt.date.today().isoformat()
+    examples = load_json(EXAMPLES_FILE, [])
+    examples_text = "\n\n=====\n\n".join(examples[-5:])
+    facts_text = json.dumps(facts, indent=2, ensure_ascii=False)
+
+    prompt = f"""Today is {today}. You are the editor of "Volunteens" (t.me/Volunteensuz), an Uzbek
+Telegram channel for young people from Uzbekistan. Below are verified facts about opportunities.
+Write one post for each, in natural, fluent Uzbek.
+
+Use ONLY the facts given. Do not invent or add details (deadline, age, fee, dates). Copy name,
+official_url and deadline unchanged into your answer.
 
 Writing rules for post_text, which must match the channel's style EXACTLY:
 - Write in Uzbek (Latin script), as in the examples below. Keep the official program name in English.
@@ -137,49 +225,27 @@ Examples of real posts from the channel:
 
 {examples_text}
 
-Return {POSTS_PER_RUN + 2} opportunities in the required JSON format. If you could verify fewer,
-return the ones you verified. Never return an empty list: there are always open opportunities."""
+Verified facts:
 
+{facts_text}
+
+Return one entry per opportunity in the required JSON format."""
+
+    return _run(
+        client, "write",
+        model=WRITER_MODEL,
+        max_tokens=16000,
+        output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+
+def find_opportunities(already_titles: list[str]) -> list[dict]:
     client = anthropic.Anthropic()
-    messages = [{"role": "user", "content": prompt}]
-
-    for _ in range(5):  # resume if the server pauses a long search turn
-        with client.beta.messages.stream(
-            model=MODEL,
-            max_tokens=32000,
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
-            tools=[
-                {"type": "web_search_20260209", "name": "web_search", "max_uses": 8},
-                {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 8,
-                 "max_content_tokens": 6000},
-            ],
-            messages=messages,
-        ) as stream:
-            response = stream.get_final_message()
-
-        if response.stop_reason == "pause_turn":
-            messages.append({"role": "assistant", "content": response.content})
-            continue
-        break
-
-    if response.stop_reason == "refusal":
-        raise RuntimeError("Claude declined the request.")
-
-    print(f"stop_reason={response.stop_reason} usage={response.usage}")
-    texts = [b.text for b in response.content if b.type == "text"]
-    for t in reversed(texts):  # the JSON answer is the last text block
-        match = re.search(r"\{.*\}", t, re.S)
-        if match:
-            try:
-                opps = json.loads(match.group(0))["opportunities"]
-            except (json.JSONDecodeError, KeyError):
-                continue
-            if not opps:
-                print("Empty list. Last text from Claude:\n", "\n".join(texts)[-3000:])
-            return opps
-    raise RuntimeError("No JSON in response:\n" + "\n".join(texts)[-3000:])
+    facts = research_opportunities(client, already_titles)
+    if not facts:
+        return []
+    return write_posts(client, facts)
 
 
 def is_valid(opp: dict, posted: list[dict], titles: list[str]) -> bool:
@@ -204,7 +270,7 @@ def is_valid(opp: dict, posted: list[dict], titles: list[str]) -> bool:
 
 
 def format_post(o: dict) -> str:
-    body = html.escape(o["post_text"].strip())
+    body = html.escape(o["post_text"].strip(), quote=False)
     link = f'<a href="{html.escape(o["official_url"], quote=True)}">Havola</a>'
     if "Havola" in body:
         i = body.rfind("Havola")
