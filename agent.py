@@ -36,7 +36,7 @@ POSTED_FILE = HERE / "posted.json"
 HISTORY_FILE = HERE / "channel_history.json"
 EXAMPLES_FILE = HERE / "style_examples.json"
 CHANNEL = "Volunteensuz"
-MODEL = "claude-opus-5-5"
+MODEL = "claude-sonnet-5-5"  # about half the price of Opus
 
 FOOTER = ('📝 <a href="https://t.me/Volunteensuz">Telegram</a> | '
           '💻 <a href="https://www.instagram.com/volunteensuz">Instagram</a>')
@@ -101,7 +101,7 @@ def norm(s: str) -> str:
 def find_opportunities(already_titles: list[str]) -> list[dict]:
     today = dt.date.today().isoformat()
     examples = load_json(EXAMPLES_FILE, [])
-    examples_text = "\n\n=====\n\n".join(examples)
+    examples_text = "\n\n=====\n\n".join(examples[-5:])
     already = "\n".join(f"- {t}" for t in already_titles)
 
     prompt = f"""Today is {today}. You are the editor of "Volunteens" (t.me/Volunteensuz), an Uzbek
@@ -150,8 +150,9 @@ Return exactly {POSTS_PER_RUN + 2} opportunities in the required JSON format."""
             fallbacks="default",
             output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
             tools=[
-                {"type": "web_search_20260209", "name": "web_search", "max_uses": 15},
-                {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 15},
+                {"type": "web_search_20260209", "name": "web_search", "max_uses": 8},
+                {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 8,
+                 "max_content_tokens": 6000},
             ],
             messages=messages,
         ) as stream:
@@ -220,7 +221,7 @@ def main() -> int:
     posted = load_json(POSTED_FILE, [])
     history = [h["title"] for h in load_json(HISTORY_FILE, [])]
     recent = fetch_recent_channel_titles()
-    titles = list(dict.fromkeys(history[-300:] + recent + [p["name"] for p in posted]))
+    titles = list(dict.fromkeys(history[-150:] + recent + [p["name"] for p in posted]))
 
     found = find_opportunities(titles)
     all_titles = history + recent
