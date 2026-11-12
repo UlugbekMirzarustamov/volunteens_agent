@@ -38,7 +38,7 @@ HISTORY_FILE = HERE / "channel_history.json"
 EXAMPLES_FILE = HERE / "style_examples.json"
 CHANNEL = "Volunteensuz"
 SEARCH_MODEL = "claude-haiku-5-5"  # cheap: does the web search and fact-checking
-WRITER_MODEL = "claude-haiku-5-5"  # writes the posts (no tools, so few tokens)
+WRITER_MODEL = "claude-sonnet-5-5"  # better Uzbek; writes the posts (no tools, so few tokens)
 
 FOOTER = ('📝 <a href="https://t.me/Volunteensuz">Telegram</a> | '
           '💻 <a href="https://www.instagram.com/volunteensuz">Instagram</a>')
@@ -159,18 +159,28 @@ def research_opportunities(client: anthropic.Anthropic, already_titles: list[str
     already = "\n".join(f"- {t}" for t in already_titles)
 
     prompt = f"""Today is {today}. You research opportunities for "Volunteens" (t.me/Volunteensuz), an
-Uzbek Telegram channel that shares international opportunities with school and university students
-and young people from Uzbekistan: forums, summits, fellowships, research programs (like Lumiere,
-Polygence, RSI), leadership/innovation programs (like TKS), scholarships and grants, competitions
-and olympiads, summer/winter schools and camps, MUNs, internships and volunteering.
+Uzbek Telegram channel for young people from Uzbekistan, mostly aged 15-30 (school pupils,
+university students, young people). Any event or program young people can join fits: international
+forums, summits and youth conferences, MUNs, hackathons, competitions and olympiads, summer/winter
+schools and camps, exchange programs, leadership/innovation programs (like TKS), research programs
+(like Lumiere, Polygence, RSI), scholarships and grants, volunteering and internships.
 
 TASK: Find {POSTS_PER_RUN + 2} opportunities that are open right now and collect verified facts.
+
+What to look for:
+- Mainly opportunities for ages 15-30. A few outside that range are fine, but most must fit it.
+- Mix INTERNATIONAL opportunities with events IN UZBEKISTAN (Tashkent and other cities):
+  hackathons, IT and startup competitions (e.g. IT Park, tech communities), youth forums,
+  MUNs, olympiads, volunteering, trainings and camps for Uzbek youth. Search in Uzbek and Russian
+  too (e.g. "xakaton 2026", "yoshlar forumi", "хакатон Ташкент").
+- Avoid PhD, postdoc and master's-level opportunities and jobs for experienced professionals.
+  At most one per run, and only if it is exceptional.
+- Prefer free, fully funded or partially funded opportunities. Mix the types.
 
 Rules:
 - Use web search, then open each opportunity's OFFICIAL page to verify the facts.
 - The deadline must be after {today} (or genuinely rolling). Skip anything closed.
-- Citizens of Uzbekistan / international applicants must be eligible.
-- Prefer free, fully funded or partially funded opportunities. Mix the types.
+- People from Uzbekistan must be eligible.
 - Never guess a fact (deadline, age, fee). If you can't confirm it, leave it out or pick another opportunity.
 - official_url = the official application or info page, not a blog or aggregator.
 - In "facts", write in English everything a post needs: organizer, what it is, what participants
@@ -197,7 +207,7 @@ return the ones you verified. Never return an empty list: there are always open 
 
 
 def write_posts(client: anthropic.Anthropic, facts: list[dict]) -> list[dict]:
-    """Step 2 (Haiku 5.5): turn the verified facts into Uzbek posts in the channel's style."""
+    """Step 2 (Sonnet 5.5): turn the verified facts into Uzbek posts in the channel's style."""
     today = dt.date.today().isoformat()
     examples = load_json(EXAMPLES_FILE, [])
     examples_text = "\n\n=====\n\n".join(examples[-5:])
@@ -235,6 +245,8 @@ Return one entry per opportunity in the required JSON format."""
         client, "write",
         model=WRITER_MODEL,
         max_tokens=16000,
+        betas=["server-side-fallback-2026-07-01"],
+        fallbacks="default",
         output_config={"effort": "medium", "format": {"type": "json_schema", "schema": SCHEMA}},
         messages=[{"role": "user", "content": prompt}],
     )
